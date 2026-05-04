@@ -1215,8 +1215,86 @@ class WanVideoVAE(nn.Module):
         return video.clamp_(-1, 1)
 
 
+    def _get_encode_cuda_graph_state(self, video):
+        cache = getattr(self, "_encode_cuda_graph_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_encode_cuda_graph_cache", cache)
+
+        key = (str(video.device), str(video.dtype), tuple(video.shape[1:]))
+        if key in cache:
+            return cache[key]
+
+        static_input = torch.empty((1, *video.shape[1:]), device=video.device, dtype=video.dtype)
+        scale = [s.to(dtype=video.dtype, device=video.device) for s in self.scale]
+
+        warmup_stream = torch.cuda.Stream(device=video.device)
+        current_stream = torch.cuda.current_stream(device=video.device)
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                static_input.copy_(video[:1])
+                warmup_output = self.model.encode(static_input, scale)
+        current_stream.wait_stream(warmup_stream)
+        del warmup_output
+
+        static_input.copy_(video[:1])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            static_output = self.model.encode(static_input, scale)
+
+        cache[key] = {
+            "graph": graph,
+            "input": static_input,
+            "output": static_output,
+            "scale": scale,
+        }
+        return cache[key]
+
+
+    def _try_cuda_graph_encode(self, videos, device):
+        if not getattr(self, "_encode_cuda_graph_enabled", False):
+            return None
+        if getattr(self, "_encode_cuda_graph_failed", False):
+            return None
+        if not isinstance(videos, torch.Tensor) or videos.ndim != 5:
+            return None
+        if not torch.cuda.is_available():
+            return None
+
+        video = videos.to(device)
+        if video.device.type != "cuda" or video.shape[0] == 0:
+            return None
+
+        rng_state = torch.cuda.get_rng_state(video.device)
+        try:
+            state = self._get_encode_cuda_graph_state(video)
+            static_input = state["input"]
+            static_output = state["output"]
+            output = torch.empty(
+                (video.shape[0], *static_output.shape[1:]),
+                device=video.device,
+                dtype=static_output.dtype,
+            )
+            for idx in range(video.shape[0]):
+                static_input.copy_(video[idx:idx + 1])
+                state["graph"].replay()
+                output[idx].copy_(static_output[0])
+            return output
+        except Exception:
+            setattr(self, "_encode_cuda_graph_failed", True)
+            return None
+        finally:
+            torch.cuda.set_rng_state(rng_state, video.device)
+
+
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
         # videos = [video.to("cpu") for video in videos]
+        if not tiled:
+            cuda_graph_hidden_states = self._try_cuda_graph_encode(videos, device)
+            if cuda_graph_hidden_states is not None:
+                return cuda_graph_hidden_states
+
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)

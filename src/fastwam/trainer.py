@@ -46,6 +46,7 @@ class Wan22Trainer:
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
+        self.vae_encode_cuda_graph = bool(getattr(cfg, "vae_encode_cuda_graph", False))
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -647,6 +648,11 @@ class Wan22Trainer:
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
+        vae = getattr(unwrapped_model, "vae", None)
+        if vae is not None:
+            setattr(vae, "_encode_cuda_graph_enabled", self.vae_encode_cuda_graph)
+            if self.vae_encode_cuda_graph and self.accelerator.is_main_process:
+                logger.info("VAE encode CUDA graph replay is enabled.")
 
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
