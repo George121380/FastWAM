@@ -261,7 +261,7 @@ class Wan22Trainer:
         eta_seconds = int(remaining_steps / max(steps_per_sec, 1e-9))
         eta_h, eta_rem = divmod(eta_seconds, 3600)
         eta_m, eta_s = divmod(eta_rem, 60)
-        return f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}", steps_per_sec
+        return f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}", steps_per_sec, eta_seconds
 
     def _resume_or_load_checkpoint(self):
         resume = self.resume
@@ -702,7 +702,7 @@ class Wan22Trainer:
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
-                        eta_str, steps_per_sec = self._estimate_eta()
+                        eta_str, steps_per_sec, eta_seconds = self._estimate_eta()
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,
                             self.global_step,
@@ -726,6 +726,9 @@ class Wan22Trainer:
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            "performance/eta_seconds": eta_seconds,
+                            "performance/eta_hours": eta_seconds / 3600.0,
+                            "performance/progress_pct": 100.0 * self.global_step / max(self.max_steps, 1),
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value

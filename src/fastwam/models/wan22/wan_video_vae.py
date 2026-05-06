@@ -1,9 +1,13 @@
+import logging
+
 from einops import rearrange, repeat
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 CACHE_T = 2
 
@@ -1249,22 +1253,38 @@ class WanVideoVAE(nn.Module):
             "output": static_output,
             "scale": scale,
         }
+        logger.info(
+            "[vae_encode_cuda_graph] CAPTURED key=(device=%s, dtype=%s, shape=%s) "
+            "in_shape=%s out_shape=%s",
+            key[0], key[1], key[2],
+            tuple(static_input.shape), tuple(static_output.shape),
+        )
         return cache[key]
 
 
     def _try_cuda_graph_encode(self, videos, device):
+        def _skip(reason: str):
+            if not getattr(self, "_encode_cuda_graph_skip_logged", False):
+                logger.info(
+                    "[vae_encode_cuda_graph] SKIP path reason=%s "
+                    "(this log fires once per VAE instance)",
+                    reason,
+                )
+                setattr(self, "_encode_cuda_graph_skip_logged", True)
+            return None
+
         if not getattr(self, "_encode_cuda_graph_enabled", False):
-            return None
+            return _skip("flag_disabled")
         if getattr(self, "_encode_cuda_graph_failed", False):
-            return None
-        if not isinstance(videos, torch.Tensor) or videos.ndim != 5:
-            return None
+            return _skip("already_failed")
+        if not isinstance(videos, torch.Tensor) or getattr(videos, "ndim", 0) != 5:
+            return _skip(f"input_not_5d_tensor type={type(videos).__name__}")
         if not torch.cuda.is_available():
-            return None
+            return _skip("cuda_unavailable")
 
         video = videos.to(device)
         if video.device.type != "cuda" or video.shape[0] == 0:
-            return None
+            return _skip(f"device={video.device.type} shape0={video.shape[0]}")
 
         rng_state = torch.cuda.get_rng_state(video.device)
         try:
@@ -1281,8 +1301,13 @@ class WanVideoVAE(nn.Module):
                 state["graph"].replay()
                 output[idx].copy_(static_output[0])
             return output
-        except Exception:
+        except Exception as e:
             setattr(self, "_encode_cuda_graph_failed", True)
+            logger.warning(
+                "[vae_encode_cuda_graph] FAILED, falling back to eager encode: %r",
+                e,
+                exc_info=True,
+            )
             return None
         finally:
             torch.cuda.set_rng_state(rng_state, video.device)
