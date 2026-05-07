@@ -241,13 +241,20 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
-        z = self.vae.encode(
-            video_tensor,
-            device=self.device,
-            tiled=tiled,
-            tile_size=tile_size,
-            tile_stride=tile_stride,
-        )
+        timer = getattr(self, "_step_timer", None)
+        if timer is not None:
+            timer.begin_vae()
+        try:
+            z = self.vae.encode(
+                video_tensor,
+                device=self.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
+        finally:
+            if timer is not None:
+                timer.end_vae()
         return z
 
     @torch.no_grad()

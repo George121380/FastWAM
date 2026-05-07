@@ -19,6 +19,7 @@ from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
+from .utils.step_timer import StepTimer
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -662,7 +663,15 @@ class Wan22Trainer:
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
+        self._step_timer = StepTimer(
+            skip_warmup_steps=int(getattr(self.cfg, "vae_timing_warmup_steps", 0)),
+            enabled=self.accelerator.is_main_process,
+        )
+        if unwrapped_model is not None:
+            setattr(unwrapped_model, "_step_timer", self._step_timer)
+
         while self.global_step < self.max_steps:
+            self._step_timer.begin_step()
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
@@ -686,6 +695,7 @@ class Wan22Trainer:
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    self._step_timer.end_step()
                     self.global_step += 1
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
@@ -718,6 +728,13 @@ class Wan22Trainer:
                             steps_per_sec * self.batch_size * self.accelerator.num_processes,
                             eta_str,
                         )
+                        timing_metrics = self._step_timer.flush()
+                        if timing_metrics is not None:
+                            description += " vae_ms=%.1f step_wall_ms=%.1f vae/step=%.1f%%" % (
+                                timing_metrics["vae_encode/gpu_ms_mean"],
+                                timing_metrics["vae_encode/step_wall_ms_mean"],
+                                100.0 * timing_metrics["vae_encode/ratio_wall"],
+                            )
                         logger.info(description)
 
                         wandb_payload = {
@@ -732,6 +749,8 @@ class Wan22Trainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
+                        if timing_metrics is not None:
+                            wandb_payload.update(timing_metrics)
                         self._wandb_log(wandb_payload)
 
                     if (
