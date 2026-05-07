@@ -259,6 +259,51 @@ bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 
 对于LIBERO，我们使用单机8卡训练。对于RoboTwin，我们使用了64卡来加速训练，你可以尝试调小卡数和训练总epoch数。
 
+### 3) 多节点训练（Slurm）
+
+多节点训练（例如 4 / 8 节点 × 每节点 8 卡）使用仓库自带的 Slurm 模板：
+
+```bash
+sbatch scripts/slurm/train_multinode.sbatch
+```
+
+要换节点数，只需要改 `scripts/slurm/train_multinode.sbatch` 里的一行：
+
+```bash
+#SBATCH --nodes=4   # 改成 8、16……
+```
+
+启动器（`scripts/train_zero1.sh`）会从环境变量 `NNODES`、`NODE_RANK`、`MASTER_ADDR`、`MASTER_PORT` 中读取拓扑信息（sbatch 模板会从 `SLURM_NNODES` / `SLURM_NODEID` / `SLURM_JOB_NODELIST` 自动设置这些变量），然后把对应的 `--num_machines / --machine_rank / --main_process_ip / --main_process_port / --num_processes / --deepspeed_multinode_launcher standard` 全部传给 `accelerate launch`。`RUN_ID` 通过 `torch.distributed.TCPStore` 在节点间同步，确保每个 rank 写入同一个 `output_dir`。
+
+**前置条件：**
+
+- 仓库目录和 `./data/` 在共享文件系统（NFS / Lustre / GPFS）上，所有节点以**同一个绝对路径**可见。
+- 每个节点上都能 `source activate` 同一个 conda 环境，`module load` 同一个 cuda 版本。
+- NCCL/RoCE 环境变量（`NCCL_IB_HCA`、`NCCL_SOCKET_IFNAME` 等）在 sbatch 里已 export，由 `srun` 继承到所有节点 —— 请按你集群的 RoCE/IB 拓扑修改模板里的具体取值。
+- `MASTER_PORT`（默认 `29555`）和 `MASTER_PORT + 11`（= `29566`，`TCPStore` 用的端口）在节点之间放行。
+
+**新集群烟雾测试**：在正式跑长训练之前，先在 sbatch 训练命令的尾部追加几个 override 跑一次几分钟的短验证：
+
+```bash
+max_steps=30 save_every=20 eval_every=0 log_every=1
+```
+
+观察 slurm 日志，应该看到：
+
+- `[run_id_sync] mode=tcpstore ... run_id=<X>` —— 所有节点同一个 `<X>`；
+- `[launch] nproc_per_node=8 num_machines=<N> machine_rank=<i>` —— 每节点一行，rank `0..N-1`；
+- DeepSpeed 启动日志里 `world_size=<N×8>`；
+- `runs/{task}/{run_id}/checkpoints/state/step_000020/pytorch_model/` 下面，每个 rank 一份 `bf16_zero_pp_rank_*_mp_rank_00_optim_states.pt`，外加 `mp_rank_00_model_states.pt`。
+
+**从 checkpoint 续训**（被 `--time` 砍掉或主动 scancel 后）：
+
+```bash
+# 在 sbatch 训练命令尾部追加
+resume=./runs/{task}/{run_id}/checkpoints/state/step_XXXXXX
+```
+
+然后 `sbatch` 再交一次即可。
+
 ## 使用自己训练的权重推理
 
 `mujoco` 环境和 LIBERO 数据版本相关，最好保持一致。之后再运行 LIBERO 评测：

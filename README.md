@@ -253,10 +253,55 @@ You can then update `pretrained_norm_stats` to that file path for subsequent run
 bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
 
 # RoboTwin
-bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
+bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4 vae_encode_cuda_graph=true num_workers=16
 ```
 
 For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
+
+### 3) Multi-node training (Slurm)
+
+For multi-node training (e.g. 4 or 8 nodes × 8 GPUs each), use the provided Slurm template:
+
+```bash
+sbatch scripts/slurm/train_multinode.sbatch
+```
+
+To change the number of nodes, edit a single line in `scripts/slurm/train_multinode.sbatch`:
+
+```bash
+#SBATCH --nodes=4   # change to 8, 16, ...
+```
+
+The launcher (`scripts/train_zero1.sh`) reads `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT` from the environment (the sbatch sets these from `SLURM_NNODES` / `SLURM_NODEID` / first hostname of `SLURM_JOB_NODELIST`) and passes the matching `--num_machines / --machine_rank / --main_process_ip / --main_process_port / --num_processes / --deepspeed_multinode_launcher standard` flags to `accelerate launch`. `RUN_ID` is synchronized across nodes via `torch.distributed.TCPStore` so every rank writes to the same `output_dir`.
+
+**Prerequisites:**
+
+- The repo and `./data/` are on a shared filesystem (NFS / Lustre / GPFS) visible to every node at the same absolute path.
+- The conda env and `cuda` module are available on every node.
+- NCCL/RoCE env vars (`NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, etc.) are exported in the sbatch and inherited by `srun` — adjust the values in the template to match your cluster's RoCE/IB topology.
+- `MASTER_PORT` (default `29555`) and `MASTER_PORT + 11` (= `29566`, used for the RUN_ID `TCPStore`) are open between nodes.
+
+**Smoke test a new cluster** before kicking off a long run by appending the following overrides to the training command line in the sbatch:
+
+```bash
+max_steps=30 save_every=20 eval_every=0 log_every=1
+```
+
+After a few minutes you should see in the slurm log:
+
+- `[run_id_sync] mode=tcpstore ... run_id=<X>` — the same `<X>` on every node;
+- `[launch] nproc_per_node=8 num_machines=<N> machine_rank=<i>` — one per node, ranks `0..N-1`;
+- `world_size=<N×8>` in the DeepSpeed init log;
+- `runs/{task}/{run_id}/checkpoints/state/step_000020/pytorch_model/` containing one `bf16_zero_pp_rank_*_mp_rank_00_optim_states.pt` shard per rank, plus the `mp_rank_00_model_states.pt` model file.
+
+**Resume from a checkpoint** (e.g. after hitting `--time` cap or scancel):
+
+```bash
+# append to the training command in the sbatch
+resume=./runs/{task}/{run_id}/checkpoints/state/step_XXXXXX
+```
+
+Then `sbatch` again — the run will pick up at the saved step.
 
 ## Inference with Your Trained Checkpoints
 
