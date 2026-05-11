@@ -1,10 +1,12 @@
 import logging
+import datetime
 import json
 import inspect
 import os
 import re
 from math import ceil
 from pathlib import Path
+from typing import Optional
 import time
 
 import numpy as np
@@ -17,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
+from .utils.process_start import START as PROCESS_START
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.step_timer import StepTimer
@@ -48,6 +51,7 @@ class Wan22Trainer:
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
         self.vae_encode_cuda_graph = bool(getattr(cfg, "vae_encode_cuda_graph", False))
+        self.vae_encode_batch_parallel = bool(getattr(cfg, "vae_encode_batch_parallel", False))
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -652,8 +656,11 @@ class Wan22Trainer:
         vae = getattr(unwrapped_model, "vae", None)
         if vae is not None:
             setattr(vae, "_encode_cuda_graph_enabled", self.vae_encode_cuda_graph)
+            setattr(vae, "_encode_batch_parallel_enabled", self.vae_encode_batch_parallel)
             if self.vae_encode_cuda_graph and self.accelerator.is_main_process:
                 logger.info("VAE encode CUDA graph replay is enabled.")
+            if self.vae_encode_batch_parallel and self.accelerator.is_main_process:
+                logger.info("VAE encode batch parallel is enabled.")
 
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
@@ -663,15 +670,55 @@ class Wan22Trainer:
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
+        # Phase profiling configuration.
+        cfg_profile_phases = getattr(self.cfg, "profile_phases", None) or []
+        self._profile_phases: list[str] = [str(p) for p in list(cfg_profile_phases)]
+        self._profiling_enabled = bool(self._profile_phases)
+        self._profile_warmup_flushes = int(getattr(self.cfg, "profile_warmup_flushes", 0))
+        self._profile_data_load_all_ranks = bool(
+            getattr(self.cfg, "profile_data_load_all_ranks", True)
+        ) and self._profiling_enabled
+        self._save_final = bool(getattr(self.cfg, "save_final", True))
+        self._profile_dump_path = None
+        if self._profiling_enabled and self.accelerator.is_main_process:
+            dump_path = getattr(self.cfg, "profile_dump_path", None)
+            self._profile_dump_path = (
+                str(dump_path) if dump_path else os.path.join(self.output_dir, "timing.jsonl")
+            )
+            logger.info(
+                "Phase profiling enabled: phases=%s dump=%s data_load_all_ranks=%s",
+                self._profile_phases,
+                self._profile_dump_path,
+                self._profile_data_load_all_ranks,
+            )
+        self._flush_count = 0
+
+        # Per-rank scratch for cross-rank data_load gather.
+        self._data_load_walls_buf: list[float] = []
+        # Per-rank step wall buffer (for the rank-local mean to match StepTimer's window).
+        self._step_wall_buf: list[float] = []
+
+        # Measurement window (excludes warmup) for the [perf] final_steps_per_sec line.
+        self._measurement_warmup_steps = self._profile_warmup_flushes * max(self.log_every, 1)
+        self._measurement_start_step: Optional[int] = None
+        self._measurement_start_time: Optional[float] = None
+        # Startup time = wall seconds from process start until end of step
+        # `_startup_after_steps`. Captures imports + model load + DeepSpeed/NCCL
+        # init + first N training steps (including any cuda_graph warmup).
+        self._startup_after_steps: int = int(getattr(self.cfg, "startup_after_steps", 10))
+        self._startup_seconds: Optional[float] = None
+
         self._step_timer = StepTimer(
             skip_warmup_steps=int(getattr(self.cfg, "vae_timing_warmup_steps", 0)),
             enabled=self.accelerator.is_main_process,
+            enabled_phases=self._profile_phases,
         )
         if unwrapped_model is not None:
             setattr(unwrapped_model, "_step_timer", self._step_timer)
 
         while self.global_step < self.max_steps:
             self._step_timer.begin_step()
+            t_data = time.perf_counter()
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
@@ -681,21 +728,32 @@ class Wan22Trainer:
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)
                 continue
+            data_load_wall_ms = (time.perf_counter() - t_data) * 1000.0
+            self._step_timer.record_phase_wall("data_load", t_data)
+            if self._profile_data_load_all_ranks:
+                self._data_load_walls_buf.append(data_load_wall_ms)
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
-                self.accelerator.backward(loss)
+                self._step_timer.begin_phase("backward")
+                try:
+                    self.accelerator.backward(loss)
+                finally:
+                    self._step_timer.end_phase("backward")
 
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self._step_timer.end_step()
+                    self._step_timer.begin_phase("optimizer")
+                    try:
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                        if not self.accelerator.optimizer_step_was_skipped:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                    finally:
+                        self._step_timer.end_phase("optimizer")
                     self.global_step += 1
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
@@ -710,6 +768,59 @@ class Wan22Trainer:
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    # End the step AFTER per-step gather/.item() syncs so step_wall_ms
+                    # reflects true per-step cost including metric collectives. Excludes
+                    # the conditional logging/checkpoint blocks below (low frequency, by
+                    # design).
+                    self._step_timer.end_step()
+
+                    # Capture the measurement window start once we're past warmup.
+                    if (
+                        self._measurement_start_step is None
+                        and self.global_step - self.run_start_step >= self._measurement_warmup_steps
+                    ):
+                        self._measurement_start_step = self.global_step
+                        self._measurement_start_time = time.perf_counter()
+
+                    # Capture startup wall — process start to end of step N.
+                    if (
+                        self._startup_seconds is None
+                        and self.global_step - self.run_start_step >= self._startup_after_steps
+                    ):
+                        self._startup_seconds = time.perf_counter() - PROCESS_START
+                        if self.accelerator.is_main_process:
+                            logger.info(
+                                "[perf] startup_seconds=%.4f (process_start -> end of step %d)",
+                                self._startup_seconds,
+                                self.global_step,
+                            )
+
+                    # Cross-rank data_load gather. MUST be called by ALL ranks at the same
+                    # cadence as the main-rank flush below — collective ops require
+                    # every rank to participate. No-op when profile_data_load_all_ranks
+                    # is false (e.g. legacy mode).
+                    data_load_cross_rank_stats = None
+                    if (
+                        self._profile_data_load_all_ranks
+                        and self.log_every > 0
+                        and self.global_step % self.log_every == 0
+                    ):
+                        if self._data_load_walls_buf:
+                            buf = self._data_load_walls_buf
+                            local_stats = [sum(buf) / len(buf), max(buf), min(buf)]
+                        else:
+                            local_stats = [0.0, 0.0, 0.0]
+                        local_t = torch.tensor(
+                            local_stats, device=loss.device, dtype=torch.float32
+                        ).reshape(1, 3)
+                        gathered = self.accelerator.gather(local_t)
+                        if self.accelerator.is_main_process:
+                            data_load_cross_rank_stats = {
+                                "wall_ms_mean_across_ranks": float(gathered[:, 0].mean().item()),
+                                "wall_ms_max_across_ranks": float(gathered[:, 1].max().item()),
+                                "wall_ms_min_across_ranks": float(gathered[:, 2].min().item()),
+                            }
+                        self._data_load_walls_buf.clear()
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec, eta_seconds = self._estimate_eta()
@@ -728,7 +839,19 @@ class Wan22Trainer:
                             steps_per_sec * self.batch_size * self.accelerator.num_processes,
                             eta_str,
                         )
-                        timing_metrics = self._step_timer.flush()
+                        timing_metrics = self._step_timer.flush(
+                            batch_size=self.batch_size,
+                            world_size=self.accelerator.num_processes,
+                        )
+                        # Inject cross-rank data_load stats into the phases blob.
+                        if (
+                            timing_metrics is not None
+                            and data_load_cross_rank_stats is not None
+                            and "phases" in timing_metrics
+                        ):
+                            timing_metrics["phases"].setdefault("data_load", {}).update(
+                                data_load_cross_rank_stats
+                            )
                         if timing_metrics is not None:
                             description += " vae_ms=%.1f step_wall_ms=%.1f vae/step=%.1f%%" % (
                                 timing_metrics["vae_encode/gpu_ms_mean"],
@@ -736,6 +859,39 @@ class Wan22Trainer:
                                 100.0 * timing_metrics["vae_encode/ratio_wall"],
                             )
                         logger.info(description)
+
+                        # Profiling-mode JSONL write.
+                        if (
+                            self._profile_dump_path
+                            and timing_metrics is not None
+                            and "phases" in timing_metrics
+                        ):
+                            is_warmup = self._flush_count < self._profile_warmup_flushes
+                            self._flush_count += 1
+                            record = {
+                                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "is_warmup": is_warmup,
+                                "step_range": [
+                                    self.global_step - self.log_every + 1,
+                                    self.global_step,
+                                ],
+                                "batch_size": self.batch_size,
+                                "world_size": self.accelerator.num_processes,
+                                "n_nodes": int(os.environ.get("NNODES", "1")),
+                                "num_workers": self.num_workers,
+                                "vae_encode_cuda_graph": self.vae_encode_cuda_graph,
+                                "vae_encode_batch_parallel": self.vae_encode_batch_parallel,
+                                "startup_seconds": self._startup_seconds,
+                                "startup_after_steps": self._startup_after_steps,
+                                "run_id": os.path.basename(self.output_dir),
+                                **timing_metrics,
+                            }
+                            try:
+                                with open(self._profile_dump_path, "a") as f:
+                                    f.write(json.dumps(record) + "\n")
+                                    f.flush()
+                            except OSError as exc:
+                                logger.warning("Failed to write profile JSONL: %s", exc)
 
                         wandb_payload = {
                             "train/loss": global_loss,
@@ -750,7 +906,14 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         if timing_metrics is not None:
-                            wandb_payload.update(timing_metrics)
+                            for tk, tv in timing_metrics.items():
+                                if tk == "phases":
+                                    for pname, pdict in tv.items():
+                                        for mname, mval in pdict.items():
+                                            wandb_payload[f"profile/{pname}/{mname}"] = mval
+                                elif isinstance(tv, (int, float, bool)):
+                                    wandb_payload[tk] = tv
+                                # silently skip non-scalar entries (step_range, etc.)
                         self._wandb_log(wandb_payload)
 
                     if (
@@ -798,22 +961,61 @@ class Wan22Trainer:
                             )
 
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
+                        if self._save_final:
+                            ckpt_info = self.save_checkpoint()
+                            if self.accelerator.is_main_process:
+                                logger.info(
+                                    "[done] max_steps reached step=%d weights=%s state=%s",
+                                    self.global_step,
+                                    ckpt_info["weights_path"],
+                                    ckpt_info["state_path"],
+                                )
+                        elif self.accelerator.is_main_process:
                             logger.info(
-                                "[done] max_steps reached step=%d weights=%s state=%s",
+                                "[done] max_steps reached step=%d (save_final=false; skipped checkpoint)",
                                 self.global_step,
-                                ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
                             )
+                        self._emit_final_perf_log()
                         return
 
-        ckpt_info = self.save_checkpoint()
-        if self.accelerator.is_main_process:
+        if self._save_final:
+            ckpt_info = self.save_checkpoint()
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "[done] training finished step=%d weights=%s state=%s",
+                    self.global_step,
+                    ckpt_info["weights_path"],
+                    ckpt_info["state_path"],
+                )
+        elif self.accelerator.is_main_process:
             logger.info(
-                "[done] training finished step=%d weights=%s state=%s",
+                "[done] training finished step=%d (save_final=false; skipped checkpoint)",
                 self.global_step,
-                ckpt_info["weights_path"],
-                ckpt_info["state_path"],
             )
+        self._emit_final_perf_log()
+
+    def _emit_final_perf_log(self) -> None:
+        """Emit the [perf] line consumed by scripts/profile_overhead_check.sh.
+
+        Computed over the post-warmup measurement window so JSONL/logging/
+        checkpoint costs are included (they are excluded from step_wall_ms
+        by design — see Step 3 of the profiling plan).
+        """
+        if not self.accelerator.is_main_process:
+            return
+        if self._measurement_start_step is None or self._measurement_start_time is None:
+            logger.info(
+                "[perf] final_steps_per_sec=0.0 measured_steps=0 measured_seconds=0.0 "
+                "(measurement window never opened — run shorter than warmup)",
+            )
+            return
+        measured_steps = max(0, self.global_step - self._measurement_start_step)
+        measured_seconds = max(1e-9, time.perf_counter() - self._measurement_start_time)
+        sps = measured_steps / measured_seconds if measured_steps > 0 else 0.0
+        logger.info(
+            "[perf] final_steps_per_sec=%.4f measured_steps=%d measured_seconds=%.4f",
+            sps,
+            measured_steps,
+            measured_seconds,
+        )
         

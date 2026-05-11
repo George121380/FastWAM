@@ -1,3 +1,7 @@
+# Capture process start time as the very first line so "startup_seconds" reflects
+# the full cost of imports + hydra + run_training before the trainer is ready.
+import fastwam.utils.process_start  # noqa: F401  (side-effect: records start time)
+
 import hydra
 from omegaconf import DictConfig
 

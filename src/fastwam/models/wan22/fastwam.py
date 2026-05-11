@@ -483,95 +483,108 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        video_pre = self.video_expert.pre_dit(
-            x=latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=action,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-        )
+        timer = getattr(self, "_step_timer", None)
+        if timer is not None:
+            timer.begin_phase("dit_forward")
+        try:
+            video_pre = self.video_expert.pre_dit(
+                x=latents,
+                timestep=timestep_video,
+                context=context,
+                context_mask=context_mask,
+                action=action,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            )
 
-        action_pre = self.action_expert.pre_dit(
-            action_tokens=noisy_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=noisy_action,
+                timestep=timestep_action,
+                context=context,
+                context_mask=context_mask,
+            )
 
-        video_tokens = video_pre["tokens"]
-        action_tokens = action_pre["tokens"]
+            video_tokens = video_pre["tokens"]
+            action_tokens = action_pre["tokens"]
 
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_tokens.shape[1],
-            action_seq_len=action_tokens.shape[1],
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_tokens.device,
-        )
-        tokens_out = self.mot(
-            embeds_all={
-                "video": video_tokens,
-                "action": action_tokens,
-            },
-            attention_mask=attention_mask,
-            freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
-            },
-            context_all={
-                "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_tokens.shape[1],
+                action_seq_len=action_tokens.shape[1],
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                device=video_tokens.device,
+            )
+            tokens_out = self.mot(
+                embeds_all={
+                    "video": video_tokens,
+                    "action": action_tokens,
                 },
-                "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                attention_mask=attention_mask,
+                freqs_all={
+                    "video": video_pre["freqs"],
+                    "action": action_pre["freqs"],
                 },
-            },
-            t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
-            },
-        )
+                context_all={
+                    "video": {
+                        "context": video_pre["context"],
+                        "mask": video_pre["context_mask"],
+                    },
+                    "action": {
+                        "context": action_pre["context"],
+                        "mask": action_pre["context_mask"],
+                    },
+                },
+                t_mod_all={
+                    "video": video_pre["t_mod"],
+                    "action": action_pre["t_mod"],
+                },
+            )
 
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
 
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+            pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        finally:
+            if timer is not None:
+                timer.end_phase("dit_forward")
 
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
             pred_video = pred_video[:, :, 1:]
             target_video = target_video[:, :, 1:]
 
-        loss_video_per_sample = self._compute_video_loss_per_sample(
-            pred_video=pred_video,
-            target_video=target_video,
-            image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
-        )
-        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
-            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
-        )
-        loss_video = (loss_video_per_sample * video_weight).mean()
+        if timer is not None:
+            timer.begin_phase("loss_compute")
+        try:
+            loss_video_per_sample = self._compute_video_loss_per_sample(
+                pred_video=pred_video,
+                target_video=target_video,
+                image_is_pad=image_is_pad,
+                include_initial_video_step=include_initial_video_step,
+            )
+            video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+                loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+            )
+            loss_video = (loss_video_per_sample * video_weight).mean()
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
-        if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
-        else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
+            action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+            if action_is_pad is not None:
+                valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+                valid_sum = valid.sum(dim=1).clamp(min=1.0)
+                action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+            else:
+                action_loss_per_sample = action_loss_token.mean(dim=1)
 
-        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
-            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
-        )
-        loss_action = (action_loss_per_sample * action_weight).mean()
+            action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+                action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+            )
+            loss_action = (action_loss_per_sample * action_weight).mean()
 
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
-        loss_dict = {
-            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
-            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
-        }
+            loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+            loss_dict = {
+                "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+                "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            }
+        finally:
+            if timer is not None:
+                timer.end_phase("loss_compute")
         return loss_total, loss_dict
 
     @torch.no_grad()

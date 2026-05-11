@@ -1219,17 +1219,21 @@ class WanVideoVAE(nn.Module):
         return video.clamp_(-1, 1)
 
 
-    def _get_encode_cuda_graph_state(self, video):
+    def _get_encode_cuda_graph_state(self, video, *, batch_parallel=False):
         cache = getattr(self, "_encode_cuda_graph_cache", None)
         if cache is None:
             cache = {}
             setattr(self, "_encode_cuda_graph_cache", cache)
 
-        key = (str(video.device), str(video.dtype), tuple(video.shape[1:]))
+        mode = "batch_parallel" if batch_parallel else "serial"
+        key_shape = tuple(video.shape) if batch_parallel else tuple(video.shape[1:])
+        key = (mode, str(video.device), str(video.dtype), key_shape)
         if key in cache:
             return cache[key]
 
-        static_input = torch.empty((1, *video.shape[1:]), device=video.device, dtype=video.dtype)
+        static_shape = tuple(video.shape) if batch_parallel else (1, *video.shape[1:])
+        graph_input = video if batch_parallel else video[:1]
+        static_input = torch.empty(static_shape, device=video.device, dtype=video.dtype)
         scale = [s.to(dtype=video.dtype, device=video.device) for s in self.scale]
 
         warmup_stream = torch.cuda.Stream(device=video.device)
@@ -1237,12 +1241,12 @@ class WanVideoVAE(nn.Module):
         warmup_stream.wait_stream(current_stream)
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                static_input.copy_(video[:1])
+                static_input.copy_(graph_input)
                 warmup_output = self.model.encode(static_input, scale)
         current_stream.wait_stream(warmup_stream)
         del warmup_output
 
-        static_input.copy_(video[:1])
+        static_input.copy_(graph_input)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, capture_error_mode="thread_local"):
             static_output = self.model.encode(static_input, scale)
@@ -1254,9 +1258,9 @@ class WanVideoVAE(nn.Module):
             "scale": scale,
         }
         logger.info(
-            "[vae_encode_cuda_graph] CAPTURED key=(device=%s, dtype=%s, shape=%s) "
+            "[vae_encode_cuda_graph] CAPTURED mode=%s key=(device=%s, dtype=%s, shape=%s) "
             "in_shape=%s out_shape=%s",
-            key[0], key[1], key[2],
+            mode, key[1], key[2], key[3],
             tuple(static_input.shape), tuple(static_output.shape),
         )
         return cache[key]
@@ -1286,11 +1290,22 @@ class WanVideoVAE(nn.Module):
         if video.device.type != "cuda" or video.shape[0] == 0:
             return _skip(f"device={video.device.type} shape0={video.shape[0]}")
 
+        batch_parallel = bool(getattr(self, "_encode_batch_parallel_enabled", False))
         rng_state = torch.cuda.get_rng_state(video.device)
         try:
-            state = self._get_encode_cuda_graph_state(video)
+            state = self._get_encode_cuda_graph_state(
+                video,
+                batch_parallel=batch_parallel,
+            )
             static_input = state["input"]
             static_output = state["output"]
+            if batch_parallel:
+                static_input.copy_(video)
+                state["graph"].replay()
+                output = torch.empty_like(static_output)
+                output.copy_(static_output)
+                return output
+
             output = torch.empty(
                 (video.shape[0], *static_output.shape[1:]),
                 device=video.device,
@@ -1319,6 +1334,12 @@ class WanVideoVAE(nn.Module):
             cuda_graph_hidden_states = self._try_cuda_graph_encode(videos, device)
             if cuda_graph_hidden_states is not None:
                 return cuda_graph_hidden_states
+            if (
+                getattr(self, "_encode_batch_parallel_enabled", False)
+                and isinstance(videos, torch.Tensor)
+                and videos.ndim == 5
+            ):
+                return self.single_encode(videos, device)
 
         hidden_states = []
         for video in videos:

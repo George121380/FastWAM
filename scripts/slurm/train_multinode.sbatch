@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=fastwam-mn
-#SBATCH --nodes=1                      # 节点数；要换数只动这一行
+#SBATCH --nodes=8                      # 节点数；要换数只动这一行
 #SBATCH --ntasks-per-node=1            # 每节点一个 launcher（accelerate 内部 spawn 8 个进程）
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=128            # 留够给 num_workers=16 × 8 GPU
 #SBATCH --output=slurm-%j.out
 #SBATCH --exclusive
+#SBATCH --exclude=gpu03,gpu05    # gpu05: slurm DOWN+NOT_RESPONDING; gpu03,gpu06: 用户排除
 #SBATCH --time=96:00:00                # 4 天 wall-time 上限，5 epoch 实测 ~80h，留点余量
 set -euo pipefail
 
@@ -45,7 +46,7 @@ cd "$SLURM_SUBMIT_DIR"
 # GPU 都暴露给单个 launcher。可在下面 srun 后面加 --gpus-per-task=8 或按本集群规范加 --gres=gpu:8。
 srun --nodes="${SLURM_NNODES}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 bash -c '
   export NODE_RANK="$SLURM_NODEID"
-  bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4 vae_encode_cuda_graph=true num_workers=16 batch_size=16 wandb.enabled=true max_steps=50 save_every=999999 eval_every=0 log_every=1
+  bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4 vae_encode_cuda_graph=true vae_encode_cuda_graph_lanes=1 num_workers=16 batch_size=16 wandb.enabled=true
 '
 
 # ---- 用法 ----
