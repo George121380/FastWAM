@@ -235,9 +235,16 @@ class Base_Task(gym.Env):
         self.engine.set_renderer(self.renderer)
 
         sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # Lowered spp 32→4 and path_depth 8→2 on 2026-05-14.
+        # Reason: on B300+cu13 under 8-GPU contention, the full-spec RT
+        # pipeline triggers an svulkan2 internal bug that crashes
+        # camera.take_picture() with ErrorDeviceLost on certain scene
+        # geometries (move_stapler_pad seed 4300003 etc.). All 3 denoiser
+        # options (oidn/optix/none) fail at spp=32. Per CSDN blog evidence,
+        # lower spp also speeds up rendering 3-4x.
+        sapien.render.set_ray_tracing_samples_per_pixel(4)
+        sapien.render.set_ray_tracing_path_depth(2)
+        sapien.render.set_ray_tracing_denoiser("optix")
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

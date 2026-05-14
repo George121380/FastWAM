@@ -12,9 +12,16 @@ import envs._GLOBAL_CONFIGS as CONFIGS
 
 try:
     # ********************** CuroboPlanner (optional) **********************
-    from curobo.types.math import Pose as CuroboPose
+    try:
+        from curobo.types.math import Pose as CuroboPose
+    except ModuleNotFoundError:
+        from curobo._src.types.pose import Pose as CuroboPose
+
+    try:
+        from curobo.types.robot import JointState
+    except ModuleNotFoundError:
+        from curobo._src.state.state_joint import JointState
     import time
-    from curobo.types.robot import JointState
     from curobo.wrap.reacher.motion_gen import (
         MotionGen,
         MotionGenConfig,
