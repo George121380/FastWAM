@@ -1118,7 +1118,57 @@ class FastWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location="cpu")
+        # weights_only=False to support checkpoints that contain non-tensor
+        # objects (e.g. omegaconf.DictConfig pickled by training scripts).
+        # torch 2.6+ flipped the default to True, which rejects such files.
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        # Adapter: diffusion_policy-style training checkpoints store everything
+        # under payload["state_dicts"]["model"] as a flat state_dict with full
+        # dotted names. Re-pack into the {"mot": ..., "proprio_encoder": ...}
+        # layout this loader expects.
+        if (
+            isinstance(payload, dict)
+            and "mot" not in payload
+            and "dit" not in payload
+            and isinstance(payload.get("state_dicts"), dict)
+            and "model" in payload["state_dicts"]
+        ):
+            logger.info(
+                "Detected diffusion_policy-style checkpoint layout; remapping "
+                "state_dicts.model into {mot, proprio_encoder} format."
+            )
+            flat = payload["state_dicts"]["model"]
+            mot_sd: dict = {}
+            proprio_sd: dict = {}
+            ignored_prefixes: dict[str, int] = {}
+            for k, v in flat.items():
+                if k.startswith("mot."):
+                    # strip "mot." -> matches self.mot.state_dict() naming
+                    mot_sd[k[len("mot."):]] = v
+                elif k.startswith(("video_expert.", "action_expert.")):
+                    # already correctly named for self.mot submodules
+                    mot_sd[k] = v
+                elif k.startswith("proprio_encoder."):
+                    proprio_sd[k[len("proprio_encoder."):]] = v
+                else:
+                    # dit.* (shared duplicate of mot.*), vae.*, etc. — not used
+                    prefix = k.split(".", 1)[0]
+                    ignored_prefixes[prefix] = ignored_prefixes.get(prefix, 0) + 1
+            if ignored_prefixes:
+                logger.info(
+                    "Ignored prefixes during remap: %s",
+                    ", ".join(f"{p}={c}" for p, c in sorted(ignored_prefixes.items())),
+                )
+            new_payload = {"mot": mot_sd}
+            if proprio_sd:
+                new_payload["proprio_encoder"] = proprio_sd
+            # Preserve any extra metadata we care about
+            for k in ("step", "global_step", "epoch", "torch_dtype"):
+                if k in payload:
+                    new_payload[k] = payload[k]
+            payload = new_payload
+
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
         elif "dit" in payload:

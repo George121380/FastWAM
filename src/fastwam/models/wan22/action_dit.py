@@ -143,7 +143,9 @@ class ActionDiT(nn.Module):
         action_state = action_expert.state_dict()
         expected_backbone_keys = cls.backbone_key_set(action_state.keys())
 
-        payload = torch.load(action_dit_pretrained_path, map_location="cpu")
+        # weights_only=False to allow checkpoints with non-tensor objects
+        # (torch 2.6+ defaults to True which rejects them).
+        payload = torch.load(action_dit_pretrained_path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict):
             raise ValueError(
                 f"Invalid action backbone payload type from {action_dit_pretrained_path}: {type(payload)}"
