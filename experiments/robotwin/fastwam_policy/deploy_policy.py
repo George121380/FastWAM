@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import sys
 import time
@@ -9,11 +10,13 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
+from torchvision.transforms import InterpolationMode
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -28,6 +31,39 @@ from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_eval_crop_ratio() -> float:
+    """Match training-time RandomResizedCrop(scale=[r, r], ratio=[5/6, 5/6]) by
+    taking its deterministic centre at eval. Off by default (1.0) — set to 0.95
+    when evaluating a checkpoint trained with the FastWAM `crop_jitter` recipe.
+
+    See `experiments/notes/crop_consistency_audit.md` in the Teleop-franka-test
+    repo for the full audit. The (CenterCrop + bilinear Resize) operation is
+    applied to the 384×320 composite, *after* per-camera resize/concat, mirroring
+    the training pipeline's `RandomResizedCrop(size=[384,320], scale=[r,r])`.
+    """
+    raw = os.environ.get("ROBOTWIN_EVAL_CROP_RATIO", "1.0")
+    try:
+        r = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"ROBOTWIN_EVAL_CROP_RATIO must be a float, got {raw!r}"
+        ) from e
+    if not (0.0 < r <= 1.0):
+        raise ValueError(
+            f"ROBOTWIN_EVAL_CROP_RATIO must be in (0.0, 1.0], got {r}"
+        )
+    return r
+
+
+EVAL_CROP_RATIO = _resolve_eval_crop_ratio()
+if EVAL_CROP_RATIO < 1.0:
+    logger.info(
+        "Eval-time CenterCrop+Resize enabled: ROBOTWIN_EVAL_CROP_RATIO=%.4f "
+        "(deterministic centre of training-time RandomResizedCrop(scale=[%.4f, %.4f]))",
+        EVAL_CROP_RATIO, EVAL_CROP_RATIO, EVAL_CROP_RATIO,
+    )
 
 
 def _is_none_like(value: Any) -> bool:
@@ -230,6 +266,22 @@ class WorldActionRobotWinPolicy:
             device=self.model.device,
             dtype=self.model.torch_dtype,
         )
+
+        # Match training-time RandomResizedCrop(scale=[r, r], ratio=[5/6, 5/6])
+        # by taking its deterministic centre. No-op when ROBOTWIN_EVAL_CROP_RATIO=1.0
+        # (default), so baseline checkpoints are unaffected.
+        if EVAL_CROP_RATIO < 1.0:
+            H, W = image_tensor.shape[-2:]  # 384, 320
+            linear = math.sqrt(EVAL_CROP_RATIO)
+            crop_h, crop_w = round(H * linear), round(W * linear)
+            image_tensor = TF.center_crop(image_tensor, [crop_h, crop_w])
+            image_tensor = TF.resize(
+                image_tensor,
+                [H, W],
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 

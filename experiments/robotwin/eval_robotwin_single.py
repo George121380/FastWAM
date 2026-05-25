@@ -41,7 +41,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-POLICY_NAME = "fastwam_policy"
+POLICY_NAME = os.environ.get("ROBOTWIN_POLICY_NAME", "fastwam_policy")
 
 
 def _resolve_path(path_str: str, *, base: Path) -> Path:
@@ -260,7 +260,18 @@ def main(cfg: DictConfig):
         return_code = process.wait()
 
     if return_code != 0:
-        raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")
+        # Propagate the inner exit code verbatim. The manager treats some
+        # specific codes (e.g. 42 = consecutive close_env failures) as
+        # recoverable restart signals; raising a RuntimeError here would
+        # translate every non-zero exit into Hydra's "uncaught exception →
+        # exit 1" path, which the manager would treat as process_failed and
+        # globally abort. sys.exit(return_code) keeps the contract intact.
+        print(
+            f"[wrapper] inner eval_policy.py exited with code {return_code}. "
+            f"Log: {log_file}",
+            flush=True,
+        )
+        sys.exit(return_code)
 
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
     OmegaConf.save(

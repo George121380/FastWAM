@@ -32,6 +32,27 @@ from typing import Optional, Literal
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
+# Enforce deterministic CUDA reductions so the expert-check / curobo path
+# doesn't drift run-to-run. warn_only=True keeps it safe for ops without
+# a deterministic kernel; cudnn.deterministic+benchmark=False forces fixed
+# algorithm selection. CUBLAS_WORKSPACE_CONFIG must be set before the first
+# CUDA op (the launcher exports it).
+# Strict determinism: warn_only=False forces non-deterministic CUDA ops to
+# RAISE rather than silently warn. The motivation is that curobo planner's
+# GPU parallel reductions were producing slightly different cost values run
+# to run, which pushed `plan_success` differently on edge-case seeds and
+# caused expert_check to accept/reject the same seed inconsistently between
+# two same-quality runs.
+#
+# WARNING: if any op along the eval path (curobo / sapien / TASK_ENV setup)
+# has no deterministic implementation in this torch version, this will
+# raise inside expert_check. RoboTwin's existing `except Exception` in
+# eval_policy.py:543 will catch it and skip the seed, but if EVERY seed
+# raises, the run won't make progress. Smoke-test before relying on this.
+torch.use_deterministic_algorithms(True, warn_only=False)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 
 class Base_Task(gym.Env):
 
@@ -79,9 +100,12 @@ class Base_Task(gym.Env):
         """
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
-        np.random.seed(kwags.get("seed", 0))
-        torch.manual_seed(kwags.get("seed", 0))
-        # random.seed(kwags.get('seed', 0))
+        _ep_seed = kwags.get("seed", 0)
+        np.random.seed(_ep_seed)
+        torch.manual_seed(_ep_seed)
+        random.seed(_ep_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_ep_seed)
 
         self.FRAME_IDX = 0
         self.task_name = kwags.get("task_name")
@@ -234,17 +258,20 @@ class Base_Task(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        # Lowered spp 32→4 and path_depth 8→2 on 2026-05-14.
-        # Reason: on B300+cu13 under 8-GPU contention, the full-spec RT
-        # pipeline triggers an svulkan2 internal bug that crashes
-        # camera.take_picture() with ErrorDeviceLost on certain scene
-        # geometries (move_stapler_pad seed 4300003 etc.). All 3 denoiser
-        # options (oidn/optix/none) fail at spp=32. Per CSDN blog evidence,
-        # lower spp also speeds up rendering 3-4x.
-        sapien.render.set_ray_tracing_samples_per_pixel(4)
-        sapien.render.set_ray_tracing_path_depth(2)
-        sapien.render.set_ray_tracing_denoiser("optix")
+        # RT settings driven by env vars (set by scripts/eval.sh from QUALITY
+        # preset). Default = "mid" (spp=4 path=2 OptiX) which is the validated
+        # setting on B300+cu13: avoids the svulkan2 RT hang seen with the
+        # paper-spec spp=32 path=8 OIDN, with ~no visible quality loss.
+        # Override via env: ROBOTWIN_RT_SPP, ROBOTWIN_RT_PATH_DEPTH,
+        # ROBOTWIN_RT_DENOISER, ROBOTWIN_RT_SHADER.
+        _rt_shader = os.environ.get("ROBOTWIN_RT_SHADER", "rt")
+        _rt_spp = int(os.environ.get("ROBOTWIN_RT_SPP", "4"))
+        _rt_path_depth = int(os.environ.get("ROBOTWIN_RT_PATH_DEPTH", "2"))
+        _rt_denoiser = os.environ.get("ROBOTWIN_RT_DENOISER", "optix")
+        sapien.render.set_camera_shader_dir(_rt_shader)
+        sapien.render.set_ray_tracing_samples_per_pixel(_rt_spp)
+        sapien.render.set_ray_tracing_path_depth(_rt_path_depth)
+        sapien.render.set_ray_tracing_denoiser(_rt_denoiser)
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

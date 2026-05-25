@@ -67,10 +67,19 @@ class Sapien_TEST(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # Honour the same RT env knobs as envs/_base_task.py so the preflight
+        # check matches the QUALITY preset used at simulation time. Previously
+        # this was hardcoded to spp=32/path=8/oidn, forcing every QUALITY=mid/
+        # lo run to pay the hi-preset preflight cost and use a different config
+        # for the preflight vs. the actual rollouts.
+        _shader = os.environ.get("ROBOTWIN_RT_SHADER", "rt")
+        _spp = int(os.environ.get("ROBOTWIN_RT_SPP", "4"))
+        _depth = int(os.environ.get("ROBOTWIN_RT_PATH_DEPTH", "2"))
+        _denoiser = os.environ.get("ROBOTWIN_RT_DENOISER", "optix")
+        sapien.render.set_camera_shader_dir(_shader)
+        sapien.render.set_ray_tracing_samples_per_pixel(_spp)
+        sapien.render.set_ray_tracing_path_depth(_depth)
+        sapien.render.set_ray_tracing_denoiser(_denoiser)
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

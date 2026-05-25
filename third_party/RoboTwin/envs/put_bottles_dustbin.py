@@ -9,6 +9,17 @@ class put_bottles_dustbin(Base_Task):
     def setup_demo(self, **kwags):
         super()._init_task_env_(table_xy_bias=[0.3, 0], **kwags)
 
+    def _shift_grasp_action_z(self, action_group, z_delta):
+        actions = action_group[1] if action_group is not None and len(action_group) > 1 else []
+        shifted = False
+        for action in actions:
+            if action is not None and action.action == "move":
+                action.target_pose[2] += z_delta
+                shifted = True
+        if not shifted:
+            self.plan_success = False
+        return shifted
+
     def load_actors(self):
         pose_lst = []
 
@@ -94,8 +105,8 @@ class put_bottles_dustbin(Base_Task):
             else:
                 # Grasp the bottle with right arm while moving left arm to origin
                 right_action = self.grasp_actor(bottle, arm_tag=arm_tag, pre_grasp_dis=0.1)
-                right_action[1][0].target_pose[2] += delta_dis
-                right_action[1][1].target_pose[2] += delta_dis
+                if not self._shift_grasp_action_z(right_action, delta_dis):
+                    return self.info
                 self.move(right_action, self.back_to_origin("left"))
                 # Move right arm up
                 self.move(self.move_by_displacement(arm_tag, z=0.1))
@@ -113,8 +124,8 @@ class put_bottles_dustbin(Base_Task):
                     ))
                 # Grasp the bottle with left arm (adjusted height)
                 left_action = self.grasp_actor(bottle, arm_tag="left", pre_grasp_dis=0.1)
-                left_action[1][0].target_pose[2] -= delta_dis
-                left_action[1][1].target_pose[2] -= delta_dis
+                if not self._shift_grasp_action_z(left_action, -delta_dis):
+                    return self.info
                 self.move(left_action)
                 # Open right gripper
                 self.move(self.open_gripper(ArmTag("right")))
